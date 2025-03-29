@@ -30,6 +30,7 @@ import {
 } from "../integrations/misc/extract-text"
 import { countFileLines } from "../integrations/misc/line-counter"
 import { fetchInstructionsTool } from "./tools/fetchInstructionsTool"
+import { readFileTool } from "./tools/readFileTool"
 import { ExitCodeDetails } from "../integrations/terminal/TerminalProcess"
 import { Terminal } from "../integrations/terminal/Terminal"
 import { TerminalRegistry } from "../integrations/terminal/TerminalRegistry"
@@ -82,9 +83,7 @@ import { insertGroups } from "./diff/insert-groups"
 import { telemetryService } from "../services/telemetry/TelemetryService"
 import { validateToolUse, isToolAllowedForMode, ToolName } from "./mode-validator"
 import { parseXml } from "../utils/xml"
-import { readLines } from "../integrations/misc/read-lines"
 import { getWorkspacePath } from "../utils/path"
-import { isBinaryFile } from "isbinaryfile"
 
 export type ToolResponse = string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>
 type UserContent = Array<Anthropic.Messages.ContentBlockParam>
@@ -2256,155 +2255,12 @@ export class Cline extends EventEmitter<ClineEvents> {
 					}
 
 					case "read_file": {
-						const relPath: string | undefined = block.params.path
-						const startLineStr: string | undefined = block.params.start_line
-						const endLineStr: string | undefined = block.params.end_line
-
-						// Get the full path and determine if it's outside the workspace
-						const fullPath = relPath ? path.resolve(this.cwd, removeClosingTag("path", relPath)) : ""
-						const isOutsideWorkspace = isPathOutsideWorkspace(fullPath)
-
-						const sharedMessageProps: ClineSayTool = {
-							tool: "readFile",
-							path: getReadablePath(this.cwd, removeClosingTag("path", relPath)),
-							isOutsideWorkspace,
-						}
-						try {
-							if (block.partial) {
-								const partialMessage = JSON.stringify({
-									...sharedMessageProps,
-									content: undefined,
-								} satisfies ClineSayTool)
-								await this.ask("tool", partialMessage, block.partial).catch(() => {})
-								break
-							} else {
-								if (!relPath) {
-									this.consecutiveMistakeCount++
-									pushToolResult(await this.sayAndCreateMissingParamError("read_file", "path"))
-									break
-								}
-
-								// Check if we're doing a line range read
-								let isRangeRead = false
-								let startLine: number | undefined = undefined
-								let endLine: number | undefined = undefined
-
-								// Check if we have either range parameter
-								if (startLineStr || endLineStr) {
-									isRangeRead = true
-								}
-
-								// Parse start_line if provided
-								if (startLineStr) {
-									startLine = parseInt(startLineStr)
-									if (isNaN(startLine)) {
-										// Invalid start_line
-										this.consecutiveMistakeCount++
-										await this.say("error", `Failed to parse start_line: ${startLineStr}`)
-										pushToolResult(formatResponse.toolError("Invalid start_line value"))
-										break
-									}
-									startLine -= 1 // Convert to 0-based index
-								}
-
-								// Parse end_line if provided
-								if (endLineStr) {
-									endLine = parseInt(endLineStr)
-
-									if (isNaN(endLine)) {
-										// Invalid end_line
-										this.consecutiveMistakeCount++
-										await this.say("error", `Failed to parse end_line: ${endLineStr}`)
-										pushToolResult(formatResponse.toolError("Invalid end_line value"))
-										break
-									}
-
-									// Convert to 0-based index
-									endLine -= 1
-								}
-
-								const accessAllowed = this.rooIgnoreController?.validateAccess(relPath)
-								if (!accessAllowed) {
-									await this.say("rooignore_error", relPath)
-									pushToolResult(formatResponse.toolError(formatResponse.rooIgnoreError(relPath)))
-
-									break
-								}
-
-								this.consecutiveMistakeCount = 0
-								const absolutePath = path.resolve(this.cwd, relPath)
-								const completeMessage = JSON.stringify({
-									...sharedMessageProps,
-									content: absolutePath,
-								} satisfies ClineSayTool)
-
-								const didApprove = await askApproval("tool", completeMessage)
-								if (!didApprove) {
-									break
-								}
-
-								// Get the maxReadFileLine setting
-								const { maxReadFileLine = 500 } = (await this.providerRef.deref()?.getState()) ?? {}
-
-								// Count total lines in the file
-								let totalLines = 0
-								try {
-									totalLines = await countFileLines(absolutePath)
-								} catch (error) {
-									console.error(`Error counting lines in file ${absolutePath}:`, error)
-								}
-
-								// now execute the tool like normal
-								let content: string
-								let isFileTruncated = false
-								let sourceCodeDef = ""
-
-								const isBinary = await isBinaryFile(absolutePath).catch(() => false)
-
-								if (isRangeRead) {
-									if (startLine === undefined) {
-										content = addLineNumbers(await readLines(absolutePath, endLine, startLine))
-									} else {
-										content = addLineNumbers(
-											await readLines(absolutePath, endLine, startLine),
-											startLine + 1,
-										)
-									}
-								} else if (!isBinary && maxReadFileLine >= 0 && totalLines > maxReadFileLine) {
-									// If file is too large, only read the first maxReadFileLine lines
-									isFileTruncated = true
-
-									const res = await Promise.all([
-										maxReadFileLine > 0 ? readLines(absolutePath, maxReadFileLine - 1, 0) : "",
-										parseSourceCodeDefinitionsForFile(absolutePath, this.rooIgnoreController),
-									])
-
-									content = res[0].length > 0 ? addLineNumbers(res[0]) : ""
-									const result = res[1]
-									if (result) {
-										sourceCodeDef = `\n\n${result}`
-									}
-								} else {
-									// Read entire file
-									content = await extractTextFromFile(absolutePath)
-								}
-
-								// Add truncation notice if applicable
-								if (isFileTruncated) {
-									content += `\n\n[Showing only ${maxReadFileLine} of ${totalLines} total lines. Use start_line and end_line if you need to read more]${sourceCodeDef}`
-								}
-
-								pushToolResult(content)
-								break
-							}
-						} catch (error) {
-							await handleError("reading file", error)
-							break
-						}
+						await readFileTool(this, block, askApproval, handleError, pushToolResult, removeClosingTag)
+						break
 					}
 
 					case "fetch_instructions": {
-						fetchInstructionsTool(this, block, askApproval, handleError, pushToolResult)
+						await fetchInstructionsTool(this, block, askApproval, handleError, pushToolResult)
 						break
 					}
 
@@ -2610,7 +2466,8 @@ export class Cline extends EventEmitter<ClineEvents> {
 								}
 								break
 							} else {
-								let browserActionResult: BrowserActionResult
+								// Initialize with empty object to avoid "used before assigned" errors
+								let browserActionResult: BrowserActionResult = {}
 								if (action === "launch") {
 									if (!url) {
 										this.consecutiveMistakeCount++
@@ -2696,9 +2553,9 @@ export class Cline extends EventEmitter<ClineEvents> {
 										pushToolResult(
 											formatResponse.toolResult(
 												`The browser action has been executed. The console logs and screenshot have been captured for your analysis.\n\nConsole logs:\n${
-													browserActionResult.logs || "(No new logs)"
+													browserActionResult?.logs || "(No new logs)"
 												}\n\n(REMEMBER: if you need to proceed to using non-\`browser_action\` tools or launch a new browser, you MUST first close this browser. For example, if after analyzing the logs and screenshot you need to edit a file, you must first close the browser before you can use the write_to_file tool.)`,
-												browserActionResult.screenshot ? [browserActionResult.screenshot] : [],
+												browserActionResult?.screenshot ? [browserActionResult.screenshot] : [],
 											),
 										)
 										break
